@@ -1,4 +1,15 @@
 import sys
+
+# Correção para "NoneType object has no attribute write" em modo windowed (pyinstaller -w)
+class NullWriter:
+    def write(self, text): pass
+    def flush(self): pass
+
+if sys.stdout is None:
+    sys.stdout = NullWriter()
+if sys.stderr is None:
+    sys.stderr = NullWriter()
+
 import os
 import json
 from datetime import datetime

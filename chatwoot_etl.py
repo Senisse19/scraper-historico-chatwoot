@@ -13,6 +13,7 @@ import json
 import time
 import requests
 import argparse
+import sys # Added for stdout checks
 from typing import List, Dict, Optional
 from datetime import datetime
 from tqdm import tqdm
@@ -67,17 +68,21 @@ class ChatwootETL:
         self.rate_limit_delay = 0.5  # Delay padrão entre requisições (500ms)
         self.max_retries = 3  # Número máximo de tentativas em caso de erro
         
-        print(f"✅ Configuração carregada com sucesso!")
-        print(f"   API URL: {self.api_url}")
-        print(f"   Account ID: {self.account_id}")
+        self._log(f"✅ Configuração carregada com sucesso!", 5)
+        self._log(f"   API URL: {self.api_url}")
+        self._log(f"   Account ID: {self.account_id}")
         if self.start_date:
-            print(f"   Início: {self.start_date}")
+            self._log(f"   Início: {self.start_date}")
     def _log(self, message: str, progress: int = None):
         """Log interno que decide entre print ou callback"""
         if self.progress_callback and progress is not None:
             self.progress_callback(progress, message)
-        elif not self.progress_callback:
-            print(message)
+        
+        # Só imprime se NÂO tiver callback E tiver stdout disponível
+        # Evita crash em modo windowed
+        if not self.progress_callback:
+            if sys.stdout is not None:
+                print(message)
 
     def _make_request(self, endpoint: str, params: Optional[Dict] = None, debug: bool = False) -> Optional[Dict]:
         """
@@ -94,9 +99,9 @@ class ChatwootETL:
         url = f"{self.api_url}{endpoint}"
         
         if debug:
-            print(f"🔍 DEBUG: {url}")
+            self._log(f"🔍 DEBUG: {url}")
             if params:
-                print(f"🔍 Parâmetros: {params}")
+                self._log(f"🔍 Parâmetros: {params}")
         
         for attempt in range(self.max_retries):
             try:
@@ -105,27 +110,27 @@ class ChatwootETL:
                 # Rate limiting - Too Many Requests
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
-                    print(f"⚠️  Rate limit atingido. Aguardando {retry_after}s...")
+                    self._log(f"⚠️  Rate limit atingido. Aguardando {retry_after}s...")
                     time.sleep(retry_after)
                     continue
                 
                 # Erro de autenticação
                 if response.status_code == 401:
-                    print(f"❌ Erro 401: Autenticação falhou")
-                    print(f"🔍 Resposta: {response.text[:500]}")
+                    self._log(f"❌ Erro 401: Autenticação falhou")
+                    self._log(f"🔍 Resposta: {response.text[:500]}")
                     raise Exception("❌ Erro de autenticação. Verifique seu ACCESS_TOKEN")
                 
                 # Outros erros HTTP
                 if response.status_code >= 400:
-                    print(f"⚠️  Erro HTTP {response.status_code} em {endpoint}")
-                    print(f"   Tentativa {attempt + 1}/{self.max_retries}")
+                    self._log(f"⚠️  Erro HTTP {response.status_code} em {endpoint}")
+                    self._log(f"   Tentativa {attempt + 1}/{self.max_retries}")
                     
                     # Mostra resposta de erro para debug
                     try:
                         error_data = response.json()
-                        print(f"🔍 Detalhes: {error_data}")
+                        self._log(f"🔍 Detalhes: {error_data}")
                     except:
-                        print(f"🔍 Resposta: {response.text[:500]}")
+                        self._log(f"🔍 Resposta: {response.text[:500]}")
                     
                     if attempt < self.max_retries - 1:
                         time.sleep(2 ** attempt)  # Exponential backoff
@@ -137,14 +142,14 @@ class ChatwootETL:
                 return response.json()
                 
             except requests.exceptions.Timeout:
-                print(f"⚠️  Timeout na requisição. Tentativa {attempt + 1}/{self.max_retries}")
+                self._log(f"⚠️  Timeout na requisição. Tentativa {attempt + 1}/{self.max_retries}")
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
                     continue
                 return None
                 
             except requests.exceptions.RequestException as e:
-                print(f"❌ Erro na requisição: {str(e)}")
+                self._log(f"❌ Erro na requisição: {str(e)}")
                 return None
         
         return None
@@ -172,10 +177,10 @@ class ChatwootETL:
             inbox_name = inbox.get('name', 'Canal Desconhecido')
             self.inbox_map[inbox_id] = inbox_name
         
-        print(f"✅ {len(self.inbox_map)} canais mapeados:")
+        self._log(f"✅ {len(self.inbox_map)} canais mapeados:")
         for inbox_id, name in self.inbox_map.items():
-            print(f"   - ID {inbox_id}: {name}")
-        print()
+            self._log(f"   - ID {inbox_id}: {name}")
+        self._log("")
         
         return True
     
@@ -187,7 +192,7 @@ class ChatwootETL:
         Returns:
             Lista de todas as conversas
         """
-        print("💬 Buscando conversas...")
+        self._log("💬 Buscando conversas...")
         
         # Estratégia 1: Buscar todas as conversas de uma vez
         conversations = self._get_conversations_all_status()
@@ -195,7 +200,7 @@ class ChatwootETL:
         if conversations:
             return conversations
         
-        print("⚠️  Estratégia padrão falhou. Tentando buscar por inbox...")
+        self._log("⚠️  Estratégia padrão falhou. Tentando buscar por inbox...")
         
         # Estratégia 2: Buscar conversas por cada inbox
         conversations = self._get_conversations_by_inbox()
@@ -234,7 +239,7 @@ class ChatwootETL:
         status_filters = ['all', 'open', 'resolved', 'pending']
         
         for status in status_filters:
-            print(f"🔍 Tentando buscar conversas com status: {status}")
+            self._log(f"🔍 Tentando buscar conversas com status: {status}")
             
             page = 1
             endpoint = f"/api/v1/accounts/{self.account_id}/conversations"
@@ -255,7 +260,7 @@ class ChatwootETL:
                 payload = response['data'].get('payload', [])
                 
                 if total_count > 0:
-                    print(f"✅ Encontradas {total_count} conversas com status '{status}'")
+                    self._log(f"✅ Encontradas {total_count} conversas com status '{status}'")
                     all_conversations.extend(payload)
                     
                     # Calcula número de páginas
@@ -292,7 +297,7 @@ class ChatwootETL:
                 payload = response.get('payload', [])
                 
                 if total_count > 0:
-                    print(f"✅ Encontradas {total_count} conversas com status '{status}'")
+                    self._log(f"✅ Encontradas {total_count} conversas com status '{status}'")
                     all_conversations = payload
                     return all_conversations
         
@@ -305,7 +310,7 @@ class ChatwootETL:
         """
         all_conversations = []
         
-        print(f"📨 Buscando conversas por canal (inbox)...")
+        self._log(f"📨 Buscando conversas por canal (inbox)...")
         
         for inbox_id, inbox_name in tqdm(self.inbox_map.items(), desc="Canais processados", unit="canal"):
             endpoint = f"/api/v1/accounts/{self.account_id}/conversations"
@@ -331,7 +336,7 @@ class ChatwootETL:
                         conversations = response['payload']
                     
                     if conversations:
-                        print(f"   ✅ {len(conversations)} conversas em '{inbox_name}'")
+                        self._log(f"   ✅ {len(conversations)} conversas em '{inbox_name}'")
                         all_conversations.extend(conversations)
                         break  # Encontrou com essa combinação, próximo inbox
         
@@ -339,9 +344,9 @@ class ChatwootETL:
             # Remove duplicatas (mesma conversa pode aparecer em múltiplos status)
             unique_conversations = {conv['id']: conv for conv in all_conversations}.values()
             all_conversations = list(unique_conversations)
-            print(f"\n✅ Total: {len(all_conversations)} conversas únicas carregadas\n")
+            self._log(f"\n✅ Total: {len(all_conversations)} conversas únicas carregadas\n")
         else:
-            print("\n❌ Nenhuma conversa encontrada em nenhum canal\n")
+            self._log("\n❌ Nenhuma conversa encontrada em nenhum canal\n")
         
         return all_conversations
     
@@ -477,28 +482,28 @@ class ChatwootETL:
     
     def run(self):
         """Executa o processo completo de ETL"""
-        print("=" * 60)
-        print("🚀 CHATWOOT FULL ETL - EXTRACT")
-        print("=" * 60)
-        print()
+        self._log("=" * 60)
+        self._log("🚀 CHATWOOT FULL ETL - EXTRACT")
+        self._log("=" * 60)
+        self._log("")
         
         start_time = time.time()
         
         # Passo 1: Carregar mapeamento de canais
         if not self.load_inbox_map():
-            print("❌ Falha ao carregar inboxes. Abortando...")
+            self._log("❌ Falha ao carregar inboxes. Abortando...")
             return
         
         # Passo 2: Buscar todas as conversas (com paginação)
         conversations = self.get_all_conversations()
         
         if not conversations:
-            print("⚠️  Nenhuma conversa encontrada")
+            self._log("⚠️  Nenhuma conversa encontrada")
             return
 
         # Filtro de Conversas (Otimização)
         if self.start_date:
-            print("🔍 Filtrando conversas por data de atividade...")
+            self._log("🔍 Filtrando conversas por data de atividade...")
             initial_count = len(conversations)
             filtered_conversations = []
             
@@ -517,17 +522,17 @@ class ChatwootETL:
                     filtered_conversations.append(conv) # Mantém se não tiver data
             
             conversations = filtered_conversations
-            print(f"   📉 Conversas após filtro: {len(conversations)} (de {initial_count})")
+            self._log(f"   📉 Conversas após filtro: {len(conversations)} (de {initial_count})")
             
             if not conversations:
-                print("⚠️  Nenhuma conversa ativa no período selecionado")
+                self._log("⚠️  Nenhuma conversa ativa no período selecionado")
                 return
         
         # Passo 3: Transformar mensagens no formato desejado
         transformed_data = self.transform_messages(conversations)
         
         if not transformed_data:
-            print("⚠️  Nenhuma mensagem para salvar")
+            self._log("⚠️  Nenhuma mensagem para salvar")
             return
         
         # Passo 4: Salvar em JSON
@@ -547,17 +552,19 @@ class ChatwootETL:
         
         # Estatísticas finais
         elapsed_time = time.time() - start_time
-        print()
-        print("=" * 60)
-        print("📊 ESTATÍSTICAS DA EXTRAÇÃO")
-        print("=" * 60)
-        print(f"⏱️  Tempo total: {elapsed_time:.2f} segundos")
-        print(f"💬 Conversas processadas: {len(conversations)}")
-        print(f"📨 Mensagens extraídas: {len(transformed_data)}")
-        print(f"📁 Arquivo gerado: chatwoot_history_dump.json")
-        print()
-        print("✅ ETL concluído com sucesso!")
-        print("=" * 60)
+        # Estatísticas finais
+        elapsed_time = time.time() - start_time
+        self._log("")
+        self._log("=" * 60)
+        self._log("📊 ESTATÍSTICAS DA EXTRAÇÃO")
+        self._log("=" * 60)
+        self._log(f"⏱️  Tempo total: {elapsed_time:.2f} segundos")
+        self._log(f"💬 Conversas processadas: {len(conversations)}")
+        self._log(f"📨 Mensagens extraídas: {len(transformed_data)}")
+        self._log(f"📁 Arquivo gerado: chatwoot_history_dump.json")
+        self._log("")
+        self._log("✅ ETL concluído com sucesso!")
+        self._log("=" * 60)
 
 
 
