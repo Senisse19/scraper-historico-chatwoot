@@ -13,12 +13,14 @@ import json
 import time
 import requests
 import argparse
-import sys # Added for stdout checks
+import sys
+import pickle
 from typing import List, Dict, Optional
 from datetime import datetime
+from pathlib import Path
 from tqdm import tqdm
 from dotenv import load_dotenv
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class ChatwootETL:
@@ -67,6 +69,11 @@ class ChatwootETL:
         self.inbox_map = {}  # Mapa de inbox_id -> nome do canal
         self.rate_limit_delay = 0.5  # Delay padrão entre requisições (500ms)
         self.max_retries = 3  # Número máximo de tentativas em caso de erro
+        self.cache_dir = Path('exports/.cache')  # Diretório para cache
+        self.cache_ttl = 3600  # TTL do cache: 1 hora
+        self.max_workers = 10  # Número máximo de threads paralelas
+        self.adaptive_rate_limit = True  # Usa rate limiting adaptativo
+        self.last_request_time = 0  # Para rate limiting adaptativo
         
         self._log(f"✅ Configuração carregada com sucesso!", 5)
         self._log(f"   API URL: {self.api_url}")
@@ -112,6 +119,9 @@ class ChatwootETL:
                     retry_after = int(response.headers.get('Retry-After', 60))
                     self._log(f"⚠️  Rate limit atingido. Aguardando {retry_after}s...")
                     time.sleep(retry_after)
+                    # Aumenta o delay para futuras requisições
+                    if self.adaptive_rate_limit:
+                        self.rate_limit_delay = min(self.rate_limit_delay * 1.5, 3.0)
                     continue
                 
                 # Erro de autenticação
@@ -138,7 +148,18 @@ class ChatwootETL:
                     return None
                 
                 # Sucesso
-                time.sleep(self.rate_limit_delay)  # Delay preventivo
+                if self.adaptive_rate_limit:
+                    # Calcula tempo decorrido desde última requisição
+                    elapsed = time.time() - self.last_request_time
+                    if elapsed < self.rate_limit_delay:
+                        time.sleep(self.rate_limit_delay - elapsed)
+                    
+                    # Reduz gradualmente o delay após requisições bem-sucedidas
+                    self.rate_limit_delay = max(self.rate_limit_delay * 0.95, 0.1)
+                    self.last_request_time = time.time()
+                else:
+                    time.sleep(self.rate_limit_delay)  # Delay fixo
+                    
                 return response.json()
                 
             except requests.exceptions.Timeout:
@@ -156,13 +177,31 @@ class ChatwootETL:
     
     def load_inbox_map(self) -> bool:
         """
-        Carrega o mapeamento de Inboxes (id -> nome do canal)
+        Carrega o mapeamento de Inboxes (id -> nome do canal) com cache
         
         Returns:
             True se bem sucedido, False caso contrário
         """
         self._log("📥 Carregando mapeamento de canais (Inboxes)...", 10)
         
+        # Tenta carregar do cache primeiro
+        cache_file = self.cache_dir / 'inbox_map.pkl'
+        
+        if cache_file.exists():
+            cache_age = time.time() - cache_file.stat().st_mtime
+            if cache_age < self.cache_ttl:
+                try:
+                    with open(cache_file, 'rb') as f:
+                        self.inbox_map = pickle.load(f)
+                    self._log(f"✅ {len(self.inbox_map)} canais carregados do cache:")
+                    for inbox_id, name in self.inbox_map.items():
+                        self._log(f"   - ID {inbox_id}: {name}")
+                    self._log("")
+                    return True
+                except Exception as e:
+                    self._log(f"⚠️  Erro ao carregar cache: {e}. Buscando da API...")
+        
+        # Se não tem cache válido, busca da API
         endpoint = f"/api/v1/accounts/{self.account_id}/inboxes"
         response = self._make_request(endpoint)
         
@@ -176,6 +215,14 @@ class ChatwootETL:
             inbox_id = inbox.get('id')
             inbox_name = inbox.get('name', 'Canal Desconhecido')
             self.inbox_map[inbox_id] = inbox_name
+        
+        # Salva no cache
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.inbox_map, f)
+        except Exception as e:
+            self._log(f"⚠️  Não foi possível salvar cache: {e}")
         
         self._log(f"✅ {len(self.inbox_map)} canais mapeados:")
         for inbox_id, name in self.inbox_map.items():
@@ -247,6 +294,12 @@ class ChatwootETL:
                 'page': page,
                 'status': status
             }
+            
+            # Adiciona filtros de data se disponíveis (otimização)
+            if self.start_date:
+                params['since'] = int(self.start_date.timestamp())
+            if self.end_date:
+                params['until'] = int(self.end_date.timestamp())
             
             response = self._make_request(endpoint, params, debug=True)
             
@@ -342,8 +395,15 @@ class ChatwootETL:
         
         if all_conversations:
             # Remove duplicatas (mesma conversa pode aparecer em múltiplos status)
-            unique_conversations = {conv['id']: conv for conv in all_conversations}.values()
-            all_conversations = list(unique_conversations)
+            # Otimizado: usa set para tracking de IDs já vistos
+            seen_ids = set()
+            unique_conversations = []
+            for conv in all_conversations:
+                conv_id = conv.get('id')
+                if conv_id not in seen_ids:
+                    seen_ids.add(conv_id)
+                    unique_conversations.append(conv)
+            all_conversations = unique_conversations
             self._log(f"\n✅ Total: {len(all_conversations)} conversas únicas carregadas\n")
         else:
             self._log("\n❌ Nenhuma conversa encontrada em nenhum canal\n")
@@ -371,24 +431,15 @@ class ChatwootETL:
     def transform_messages(self, conversations: List[Dict]) -> List[Dict]:
         """
         Transforma as conversas e mensagens no formato desejado
+        Versão otimizada com paralelização de requisições HTTP
         """
         self._log("🔄 Transformando dados...", 70)
         
         transformed_messages = []
         total = len(conversations)
         
-        # Se tiver callback, não usa tqdm para não poluir
-        iterator = conversations
-        if not self.progress_callback:
-            iterator = tqdm(conversations, desc="Processando conversas", unit="conversa")
-            
-        for i, conversation in enumerate(iterator):
-            # Reporta progresso gradual durante o loop se tiver callback
-            if self.progress_callback and i % 10 == 0:
-                # Mapeia de 70% a 90%
-                current_percent = 70 + int((i / total) * 20)
-                self._log(f"Processando conversa {i}/{total}...", current_percent)
-
+        # Função helper para processar uma conversa
+        def process_conversation(conversation):
             conversation_id = conversation.get('id')
             inbox_id = conversation.get('inbox_id')
             
@@ -397,23 +448,23 @@ class ChatwootETL:
             customer_name = contact.get('name', 'Cliente Desconhecido')
             customer_email = contact.get('email', '')
             
-            # Nome do canal (do mapa criado anteriormente)
+            # Nome do canal
             channel_name = self.inbox_map.get(inbox_id, f'Canal ID {inbox_id}')
             
-            # Busca as mensagens desta conversa
+            # Busca as mensagens desta conversa (pode ser demorado)
             messages = self.get_conversation_messages(conversation_id)
             
+            conv_messages = []
             for msg in messages:
-                # Determina o tipo de mensagem (incoming/outgoing)
+                # Determina o tipo de mensagem
                 message_type = msg.get('message_type', 'outgoing')
                 
                 # Dados do remetente
                 sender = msg.get('sender')
-                sender_name = customer_name  # Padrão é cliente
+                sender_name = customer_name
                 agent_email = None
                 
                 if sender and sender.get('type') == 'User':
-                    # É um agente
                     sender_name = sender.get('name', 'Agente Desconhecido')
                     agent_email = sender.get('email', '')
                 
@@ -425,7 +476,6 @@ class ChatwootETL:
                 created_at_iso = None
                 
                 if created_at:
-                    # Chatwoot retorna timestamp Unix
                     try:
                         dt = datetime.fromtimestamp(created_at)
                         created_at_iso = dt.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -434,14 +484,14 @@ class ChatwootETL:
                 
                 # Filtro de Data nas MENSAGENS
                 if created_at:
-                     try:
+                    try:
                         msg_dt = datetime.fromtimestamp(created_at)
                         
                         if self.start_date and msg_dt < self.start_date:
                             continue
                         if self.end_date and msg_dt > self.end_date:
                             continue
-                     except:
+                    except:
                         pass
                 
                 # Monta o objeto de mensagem
@@ -457,7 +507,58 @@ class ChatwootETL:
                     "agent_email": agent_email
                 }
                 
-                transformed_messages.append(message_obj)
+                conv_messages.append(message_obj)
+            
+            return conv_messages
+        
+        # Processamento paralelo
+        if self.max_workers > 1:
+            # Usa ThreadPoolExecutor para paralelizar as requisições
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submete todas as conversas para processamento paralelo
+                futures = {executor.submit(process_conversation, conv): i 
+                          for i, conv in enumerate(conversations)}
+                
+                # Se não tiver callback, usa tqdm para progresso
+                if not self.progress_callback:
+                    futures_iter = tqdm(as_completed(futures), 
+                                       total=total, 
+                                       desc="Processando conversas", 
+                                       unit="conversa")
+                else:
+                    futures_iter = as_completed(futures)
+                
+                # Coleta resultados conforme completam
+                completed = 0
+                for future in futures_iter:
+                    try:
+                        messages = future.result()
+                        transformed_messages.extend(messages)
+                        
+                        # Reporta progresso se tiver callback
+                        if self.progress_callback:
+                            completed += 1
+                            if completed % 10 == 0:
+                                current_percent = 70 + int((completed / total) * 20)
+                                self._log(f"Processando conversa {completed}/{total}...", current_percent)
+                    except Exception as e:
+                        self._log(f"⚠️  Erro ao processar conversa: {str(e)}")
+        else:
+            # Fallback: processamento sequencial
+            iterator = conversations
+            if not self.progress_callback:
+                iterator = tqdm(conversations, desc="Processando conversas", unit="conversa")
+            
+            for i, conversation in enumerate(iterator):
+                if self.progress_callback and i % 10 == 0:
+                    current_percent = 70 + int((i / total) * 20)
+                    self._log(f"Processando conversa {i}/{total}...", current_percent)
+                
+                try:
+                    messages = process_conversation(conversation)
+                    transformed_messages.extend(messages)
+                except Exception as e:
+                    self._log(f"⚠️  Erro ao processar conversa: {str(e)}")
         
         self._log(f"✅ {len(transformed_messages)} mensagens processadas\n")
         return transformed_messages
