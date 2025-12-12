@@ -12,6 +12,7 @@ import os
 import json
 import time
 import requests
+import argparse
 from typing import List, Dict, Optional
 from datetime import datetime
 from tqdm import tqdm
@@ -22,9 +23,28 @@ import pandas as pd
 class ChatwootETL:
     """Classe para gerenciar a extração de dados do Chatwoot"""
     
-    def __init__(self):
-        """Inicializa a classe com configurações do .env"""
+    def __init__(self, start_date: Optional[str] = None, end_date: Optional[str] = None, progress_callback=None):
+        """
+        Inicializa a classe com configurações do .env e datas de filtro
+        
+        Args:
+            start_date: Data inicial (YYYY-MM-DD)
+            end_date: Data final (YYYY-MM-DD)
+            progress_callback: Função para rreportar progresso (func(percent, message))
+        """
         load_dotenv()
+
+        self.progress_callback = progress_callback
+        
+        # Configuração de datas
+        self.start_date = None
+        self.end_date = None
+        
+        if start_date:
+            self.start_date = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
+        
+        if end_date:
+            self.end_date = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
         
         self.api_url = os.getenv('CHATWOOT_API_URL', '').rstrip('/')
         self.access_token = os.getenv('CHATWOOT_ACCESS_TOKEN')
@@ -49,8 +69,16 @@ class ChatwootETL:
         
         print(f"✅ Configuração carregada com sucesso!")
         print(f"   API URL: {self.api_url}")
-        print(f"   Account ID: {self.account_id}\n")
-    
+        print(f"   Account ID: {self.account_id}")
+        if self.start_date:
+            print(f"   Início: {self.start_date}")
+    def _log(self, message: str, progress: int = None):
+        """Log interno que decide entre print ou callback"""
+        if self.progress_callback and progress is not None:
+            self.progress_callback(progress, message)
+        elif not self.progress_callback:
+            print(message)
+
     def _make_request(self, endpoint: str, params: Optional[Dict] = None, debug: bool = False) -> Optional[Dict]:
         """
         Faz requisição à API com tratamento de erros e rate limiting
@@ -128,15 +156,15 @@ class ChatwootETL:
         Returns:
             True se bem sucedido, False caso contrário
         """
-        print("📥 Carregando mapeamento de canais (Inboxes)...")
+        self._log("📥 Carregando mapeamento de canais (Inboxes)...", 10)
         
         endpoint = f"/api/v1/accounts/{self.account_id}/inboxes"
         response = self._make_request(endpoint)
         
         if not response or 'payload' not in response:
-            print("❌ Falha ao carregar inboxes")
+            self._log("❌ Falha ao carregar inboxes")
             return False
-        
+            
         inboxes = response['payload']
         
         for inbox in inboxes:
@@ -174,6 +202,28 @@ class ChatwootETL:
         
         return conversations
     
+    
+    def filter_conversations_by_date(self, conversations: List[Dict]) -> List[Dict]:
+        """Filtra lista de conversas baseado nas datas configuradas"""
+        if not self.start_date:
+            return conversations
+            
+        self._log("🔍 Filtrando conversas por data de atividade...", 50)
+        
+        filtered_conversations = []
+        for conv in conversations:
+            last_activity = conv.get('last_activity_at')
+            if last_activity:
+                try:
+                    last_act_dt = datetime.fromtimestamp(last_activity)
+                    if last_act_dt >= self.start_date:
+                        filtered_conversations.append(conv)
+                except:
+                    filtered_conversations.append(conv)
+            else:
+                filtered_conversations.append(conv)
+        return filtered_conversations
+
     def _get_conversations_all_status(self) -> List[Dict]:
         """
         Tenta buscar todas as conversas com diferentes filtros de status
@@ -316,19 +366,24 @@ class ChatwootETL:
     def transform_messages(self, conversations: List[Dict]) -> List[Dict]:
         """
         Transforma as conversas e mensagens no formato desejado
-        
-        Args:
-            conversations: Lista de conversas do Chatwoot
-            
-        Returns:
-            Lista de mensagens formatadas para análise
         """
-        print("🔄 Transformando dados...")
+        self._log("🔄 Transformando dados...", 70)
         
         transformed_messages = []
+        total = len(conversations)
         
-        # Barra de progresso para conversas
-        for conversation in tqdm(conversations, desc="Processando conversas", unit="conversa"):
+        # Se tiver callback, não usa tqdm para não poluir
+        iterator = conversations
+        if not self.progress_callback:
+            iterator = tqdm(conversations, desc="Processando conversas", unit="conversa")
+            
+        for i, conversation in enumerate(iterator):
+            # Reporta progresso gradual durante o loop se tiver callback
+            if self.progress_callback and i % 10 == 0:
+                # Mapeia de 70% a 90%
+                current_percent = 70 + int((i / total) * 20)
+                self._log(f"Processando conversa {i}/{total}...", current_percent)
+
             conversation_id = conversation.get('id')
             inbox_id = conversation.get('inbox_id')
             
@@ -372,6 +427,18 @@ class ChatwootETL:
                     except:
                         created_at_iso = str(created_at)
                 
+                # Filtro de Data nas MENSAGENS
+                if created_at:
+                     try:
+                        msg_dt = datetime.fromtimestamp(created_at)
+                        
+                        if self.start_date and msg_dt < self.start_date:
+                            continue
+                        if self.end_date and msg_dt > self.end_date:
+                            continue
+                     except:
+                        pass
+                
                 # Monta o objeto de mensagem
                 message_obj = {
                     "conversation_id": conversation_id,
@@ -387,18 +454,14 @@ class ChatwootETL:
                 
                 transformed_messages.append(message_obj)
         
-        print(f"✅ {len(transformed_messages)} mensagens processadas\n")
+        self._log(f"✅ {len(transformed_messages)} mensagens processadas\n")
         return transformed_messages
     
     def save_to_json(self, data: List[Dict], filename: str = 'chatwoot_history_dump.json'):
         """
         Salva os dados em arquivo JSON
-        
-        Args:
-            data: Lista de mensagens transformadas
-            filename: Nome do arquivo de saída
         """
-        print(f"💾 Salvando dados em {filename}...")
+        self._log(f"💾 Salvando dados em {filename}...", 90)
         
         try:
             with open(filename, 'w', encoding='utf-8') as f:
@@ -407,12 +470,10 @@ class ChatwootETL:
             file_size = os.path.getsize(filename)
             file_size_mb = file_size / (1024 * 1024)
             
-            print(f"✅ Arquivo salvo com sucesso!")
-            print(f"   Tamanho: {file_size_mb:.2f} MB")
-            print(f"   Total de mensagens: {len(data)}")
+            self._log(f"✅ Arquivo salvo com sucesso! ({file_size_mb:.2f} MB)")
             
         except Exception as e:
-            print(f"❌ Erro ao salvar arquivo: {str(e)}")
+            self._log(f"❌ Erro ao salvar arquivo: {str(e)}")
     
     def run(self):
         """Executa o processo completo de ETL"""
@@ -434,6 +495,33 @@ class ChatwootETL:
         if not conversations:
             print("⚠️  Nenhuma conversa encontrada")
             return
+
+        # Filtro de Conversas (Otimização)
+        if self.start_date:
+            print("🔍 Filtrando conversas por data de atividade...")
+            initial_count = len(conversations)
+            filtered_conversations = []
+            
+            for conv in conversations:
+                last_activity = conv.get('last_activity_at')
+                if last_activity:
+                    try:
+                        last_act_dt = datetime.fromtimestamp(last_activity)
+                        # Se a última atividade foi antes do início do filtro, 
+                        # a conversa definitivamente não tem mensagens no período (assumindo ordem cronológica)
+                        if last_act_dt >= self.start_date:
+                            filtered_conversations.append(conv)
+                    except:
+                        filtered_conversations.append(conv) # Mantém se não conseguir parsear
+                else:
+                    filtered_conversations.append(conv) # Mantém se não tiver data
+            
+            conversations = filtered_conversations
+            print(f"   📉 Conversas após filtro: {len(conversations)} (de {initial_count})")
+            
+            if not conversations:
+                print("⚠️  Nenhuma conversa ativa no período selecionado")
+                return
         
         # Passo 3: Transformar mensagens no formato desejado
         transformed_data = self.transform_messages(conversations)
@@ -443,7 +531,19 @@ class ChatwootETL:
             return
         
         # Passo 4: Salvar em JSON
-        self.save_to_json(transformed_data)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if self.start_date and self.end_date:
+            s_date = self.start_date.strftime("%Y-%m-%d")
+            e_date = self.end_date.strftime("%Y-%m-%d")
+            filename = f"chatwoot_history_{s_date}_to_{e_date}_{timestamp}.json"
+        elif self.start_date:
+            s_date = self.start_date.strftime("%Y-%m-%d")
+            filename = f"chatwoot_history_from_{s_date}_{timestamp}.json"
+        else:
+            filename = f"chatwoot_history_full_{timestamp}.json"
+            
+        self.save_to_json(transformed_data, filename)
         
         # Estatísticas finais
         elapsed_time = time.time() - start_time
@@ -460,10 +560,17 @@ class ChatwootETL:
         print("=" * 60)
 
 
+
 def main():
     """Função principal"""
+    parser = argparse.ArgumentParser(description='Chatwoot ETL Extract')
+    parser.add_argument('--start-date', type=str, help='Data inicial (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, help='Data final (YYYY-MM-DD)')
+    
+    args = parser.parse_args()
+
     try:
-        etl = ChatwootETL()
+        etl = ChatwootETL(start_date=args.start_date, end_date=args.end_date)
         etl.run()
     except ValueError as e:
         print(str(e))
